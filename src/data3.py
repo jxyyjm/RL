@@ -5,8 +5,10 @@ class DataInput:
         self.f = open(self.filename)
         self.conf = self._read_conf(conffile)
         self.memory = None
-
+        
     def get_dataset(self):
+        end_ping_num = 0 
+        all_ping_num = 0 
         for n, line in enumerate(self.f):
             parts = line.strip().split('\t')
             if len(parts) != 4:
@@ -19,11 +21,16 @@ class DataInput:
             state = list(map(int, fea))
             action = float(parts[1])
             reward = float(parts[2])
-            if parts[3][0] == '0':
+            all_ping_num += 1
+            #if parts[3][0] == '0':
+            if self.conf['LSSNum\1unknow'] in fea_n:
                 next_state = None
+                end_ping_num += 1
             else:
                 next_state = list(map(int, fea_n))
+            #print (state, action, reward, next_state)    
             yield self._one_hot(state), [action], reward, self._one_hot(next_state), parts[0]
+        print ('end_ping_num=', end_ping_num)
 
     def _read_conf(self, conffile):
         if conffile is None:
