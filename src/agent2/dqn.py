@@ -3,6 +3,7 @@ from tensorflow.keras.losses import MSE
 from tensorflow.keras.layers import Dense, Lambda
 from tensorflow.keras.models import Model
 import tensorflow as tf
+#import tensorflow_addons as tfa
 import numpy as np
 import sys, os
 sys.path.append('../')
@@ -10,15 +11,16 @@ import memory
 from policy import EpsGreedy, Greedy
 
 class DQN():
-    def __init__(self, model, actions, optimizer=None, policy=None, test_policy=None,
+    def __init__(self, model, action_space, optimizer=None, policy=None, test_policy=None,
                  memsize=10_000, target_update=10, gamma=0.99, batch_size=64, nsteps=1,
                  enable_double_dqn=True, enable_dueling_network=False, dueling_type='avg'):
-        """ 
-        TODO: Describe parameters
-        """
-        self.actions = actions
-        self.optimizer = Adam(lr=3e-3) if optimizer is None else optimizer
-
+        self.action_space = action_space
+        #self.lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=0.1, decay_steps=100000, decay_rate=0.7, staircase=True)
+        #self.optimizer = Adam(learning_rate=self.lr_schedule) if optimizer is None else optimizer
+        self.optimizer = Adam(learning_rate=1e-5) if optimizer is None else optimizer
+        #self.optimizer = tfa.optimizers.LazyAdam(learning_rate=2e-5) if optimizer is None else optimizer
+        #self.optimizer = tfa.optimizers.LazyAdam(learning_rate=self.lr_schedule) if optimizer is None else optimizer
+    
         self.policy = EpsGreedy(0.1) if policy is None else policy
         self.test_policy = Greedy() if test_policy is None else test_policy
 
@@ -36,61 +38,58 @@ class DQN():
         self.enable_double_dqn = enable_double_dqn
         self.enable_dueling_network = enable_dueling_network
         self.dueling_type = dueling_type
+        self.model = model
+        self.critic1 = self.critic = self.model
+        self.critic2 = self.model2 = tf.keras.models.clone_model(self.model)
 
-        # Create output layer based on number of actions and (optionally) a dueling architecture
-        raw_output = model.layers[-1].output
-        if self.enable_dueling_network:
-            # "Dueling Network Architectures for Deep Reinforcement Learning" (Wang et al., 2016)
-            # Output the state value (V) and the action-specific advantages (A) separately then compute the Q values: Q = A + V
-            dueling_layer = Dense(self.actions + 1, activation='linear')(raw_output)
-            if   self.dueling_type == 'avg':   f = lambda a: tf.expand_dims(a[:,0], -1) + a[:,1:] - tf.reduce_mean(a[:,1:], axis=1, keepdims=True)            elif self.dueling_type == 'max':   f = lambda a: tf.expand_dims(a[:,0], -1) + a[:,1:] - tf.reduce_max(a[:,1:], axis=1, keepdims=True)
-            elif self.dueling_type == 'naive': f = lambda a: tf.expand_dims(a[:,0], -1) + a[:,1:]
-            else: raise HkException("dueling_type must be one of {'avg','max','naive'}")
-            output_layer = Lambda(f, output_shape=(self.actions,))(dueling_layer)
-        else:   
-            output_layer = Dense(self.actions, activation='linear')(raw_output)
-
-        self.model = Model(inputs=model.input, outputs=output_layer)
-
-        # Define loss function that computes the MSE between target Q-values and cumulative discounted rewards
-        # If using PrioritizedExperienceReplay, the loss function also computes the TD error and updates the trace priorities
-        def masked_q_loss(data, y_pred):
-            """Computes the MSE between the Q-values of the actions that were taken and     the cumulative discounted
-            rewards obtained after taking those actions. Updates trace priorities if using PrioritizedExperienceReplay.
-            """
-            action_batch, target_qvals = data[:, 0], data[:, 1]
-            seq = tf.cast(tf.range(0, tf.shape(action_batch)[0]), tf.int32)
-            action_idxs = tf.transpose(tf.stack([seq, tf.cast(action_batch, tf.int32)]))
-            qvals = tf.gather_nd(y_pred, action_idxs)
-            if isinstance(self.memory, memory.PrioritizedExperienceReplay):
-                def update_priorities(_qvals, _target_qvals, _traces_idxs):
-                    """Computes the TD error and updates memory priorities."""
-                    td_error = np.abs((_target_qvals - _qvals).numpy())
-                    _traces_idxs = (tf.cast(_traces_idxs, tf.int32)).numpy()
-                    self.memory.update_priorities(_traces_idxs, td_error)
-                    return _qvals
-                qvals = tf.py_function(func=update_priorities, inp=[qvals, target_qvals, data[:,2]], Tout=tf.float32)
-            return tf.keras.losses.mse(qvals, target_qvals)
+    def masked_q_loss(y_target, y_pred):
+            return tf.keras.losses.mse(y_target, y_pred)
+            #return tf.keras.losses.Huber(y_target, y_pred)
 
         self.model.compile(optimizer=self.optimizer, loss=masked_q_loss)
+        self.critic2.compile(optimizer=self.optimizer, loss=masked_q_loss)
 
         # Clone model to use for delayed Q targets
-        self.target_model = tf.keras.models.clone_model(self.model)
-        self.target_model.set_weights(self.model.get_weights())
+        self.target_model1 = tf.keras.models.clone_model(self.model)
+        self.target_model1.set_weights(self.model.get_weights())
+
+        self.target_model2 = tf.keras.models.clone_model(self.model2)
+        self.target_model2.set_weights(self.model2.get_weights())
+
     def save(self, path, overwrite=False):
         """Saves the model parameters to the specified file(s)."""
         if not os.path.exists(path):
             os.mkdir(path)
         self.model.save_weights(path+"model.h5", overwrite=overwrite)
+        self.critic2.save_weights(path+"critic2.h5", overwrite=overwrite)
 
     def load(self, path):
         """Loads the model parameters to the specified file(s)."""
         self.model.load_weights(path+"model.h5")
+        self.critic2.load_weights(path+"critic2.h5")
+        print ('load from ', path)
 
-    def act(self, state, instance=0):
+    def predict_act_on_batch(self, model, state):
         """Returns the action to be taken given a state."""
-        qvals = self.model.predict(np.array([state]))[0]
-        return self.policy.act(qvals) if self.training else self.test_policy.act(qvals)
+        batch_size = np.shape(state)[0]
+        # actions spaces
+        actions = np.array([np.arange(self.action_space)])
+        actions = np.repeat(actions, batch_size, axis=0)
+        actions = np.reshape(actions, [-1, 1])
+
+        # states
+        states = np.repeat(state, self.action_space, axis=0)
+
+        # qvals
+        qvals = model.predict([actions, states])
+        qvals = qvals.reshape([batch_size, self.action_space])
+        return qvals
+
+    def predict_point_act_on_batch(self, states, actions):
+        """Returns the action to be taken given a state."""
+        # qvals
+        qvals = self.model.predict_on_batch([np.array(actions), np.array(states)])
+        return qvals
 
     def push(self, transition, instance=0):
         """Stores the transition in memory."""
@@ -104,12 +103,17 @@ class DQN():
         # Update target network
         if self.target_update >= 1 and step % self.target_update == 0:
             # Perform a hard update
-            self.target_model.set_weights(self.model.get_weights())
+            self.target_model1.set_weights(self.model.get_weights())
+            self.target_model2.set_weights(self.model2.get_weights())
         elif self.target_update < 1:
             # Perform a soft update
             mw = np.array(self.model.get_weights())
-            tmw = np.array(self.target_model.get_weights())
-            self.target_model.set_weights(self.target_update * mw + (1 - self.target_update) * tmw)
+            tmw = np.array(self.target_model1.get_weights())
+            self.target_model1.set_weights(self.target_update * mw + (1 - self.target_update) * tmw)
+
+            mw = np.array(self.model2.get_weights())
+            tmw = np.array(self.target_model2.get_weights())
+            self.target_model2.set_weights(self.target_update * mw + (1 - self.target_update) * tmw)
 
         # Train even when memory has fewer than the specified batch_size
         batch_size = min(len(self.memory), self.batch_size)
@@ -122,41 +126,26 @@ class DQN():
         non_final_last_next_states = [es for es in end_state_batch if es is not None]
 
         if len(non_final_last_next_states) > 0:
-            if self.enable_double_dqn:
-                # "Deep Reinforcement Learning with Double Q-learning" (van Hasselt et al., 2015)
-                # The online network predicts the actions while the target network is used to estimate the Q-values
-                q_values = self.model.predict_on_batch(np.array(non_final_last_next_states))
-                actions = np.argmax(q_values, axis=1)
-                # Estimate Q-values using the target network but select the values with the
-                # highest Q-value wrt to the online model (as computed above).
-                target_q_values = self.target_model.predict_on_batch(np.array(non_final_last_next_states))
-                selected_target_q_vals = target_q_values[range(len(target_q_values)), actions]
-            else:
-                # Use delayed target network to compute target Q-values
-                selected_target_q_vals = self.target_model.predict_on_batch(np.array(non_final_last_next_states)).max(1)
+            #selected_target_q_vals = self.target_model.predict_on_batch(np.array(non_final_last_next_states)).max(1)
+            target_q_vals1 = self.predict_act_on_batch(self.target_model1, np.array(non_final_last_next_states))
+            target_q_vals2 = self.predict_act_on_batch(self.target_model2, np.array(non_final_last_next_states))
+            target_q_vals = np.minimum(target_q_vals1, target_q_vals2)
+            #print(target_q_vals1, target_q_vals2, target_q_val)
+            selected_target_q_vals = target_q_vals.max(1)
             non_final_mask = list(map(lambda s: s is not None, end_state_batch))
             target_qvals[non_final_mask] = selected_target_q_vals
 
-        # Compute n-step discounted return
-        # If episode ended within any sampled nstep trace - zero out remaining rewards
-        for n in reversed(range(self.nsteps)):
-            rewards = np.array([b[n] for b in reward_batches])
-            target_qvals *= np.array([t[n] for t in not_done_mask])
-            target_qvals = rewards + (self.gamma * target_qvals)
+        rewards = np.array(reward_batches)
+        target_qvals = rewards + (self.gamma * target_qvals)
 
         # Compile information needed by the custom loss function
-        loss_data = [[i[0] for i in action_batch], target_qvals]
-
-        # If using PrioritizedExperienceReplay then we need to provide the trace indexes
-        # to the loss function as well so we can update the priorities of the traces
-        if isinstance(self.memory, memory.PrioritizedExperienceReplay):
-            loss_data.append(self.memory.last_traces_idxs())
+        # loss_data = [[i[0] for i in action_batch], target_qvals]
 
         # Train model
-        #q_score = self.model.predict_on_batch([np.array(action_batch), np.array(state_batch)])
-        q_score = 0 #np.mean(q_score)
+        q_score = self.model.predict_on_batch([np.array(action_batch), np.array(state_batch)])
+        q_score = np.mean(q_score)
         #print(np.array(state_batch))
         #print(target_qvals)
-        #print(loss_data)
-        loss = self.model.train_on_batch(np.array(state_batch), np.stack(loss_data).transpose())
+        loss = self.model.train_on_batch([np.array(action_batch), np.array(state_batch)], target_qvals)
+        self.critic2.train_on_batch([np.array(action_batch), np.array(state_batch)], target_qvals)
         return loss, q_score
