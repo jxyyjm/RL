@@ -56,7 +56,8 @@ class TD3():
             rewards obtained after taking those actions. Updates trace priorities if using PrioritizedExperienceReplay.
             """
             target_qvals = data[:, 0, np.newaxis]
-            if isinstance(self.memory, memory.PrioritizedExperienceReplay):
+            #if isinstance(self.memory, memory.PrioritizedExperienceReplay):
+            if False:
                 def update_priorities(_qvals, _target_qvals, _traces_idxs):
                     """Computes the TD error and updates memory priorities."""
                     td_error = np.abs((_target_qvals - _qvals).numpy())[:, 0]
@@ -163,6 +164,7 @@ class TD3():
 
         # Compute n-step discounted return
         # If episode ended within any sampled nstep trace - zero out remaining rewards
+        '''
         for n in reversed(range(self.nsteps)):
             rewards = np.array([b[n] for b in reward_batches])
             target_qvals1 *= np.array([t[n] for t in not_done_mask])
@@ -171,13 +173,19 @@ class TD3():
             target_qvals2 = rewards + (self.gamma * target_qvals2)
             target_qvals *= np.array([t[n] for t in not_done_mask])
             target_qvals = rewards + (self.gamma * target_qvals)
+        '''
+        rewards = np.array(reward_batches)
+        target_qvals = rewards + (self.gamma * target_qvals)
+        target_qvals1 = rewards + (self.gamma * target_qvals1)
+        target_qvals2 = rewards + (self.gamma * target_qvals2)
 
         # Train actor
         if step > 100_000 and step % 10 == 0:
             self.actor_train_on_batch([np.array(state_batch)])
 
         # Train critic
-        PER = isinstance(self.memory, memory.PrioritizedExperienceReplay)
+        #PER = isinstance(self.memory, memory.PrioritizedExperienceReplay)
+        PER = False
         critic_loss_data = np.stack([target_qvals1, self.memory.last_traces_idxs()], axis=1) if PER else target_qvals1
         loss = self.critic1.train_on_batch([np.array(action_batch), np.array(state_batch)], critic_loss_data)
         critic_loss_data = np.stack([target_qvals2, self.memory.last_traces_idxs()], axis=1) if PER else target_qvals2
