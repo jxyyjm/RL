@@ -35,7 +35,7 @@ class DDPG():
             rewards obtained after taking those actions. Updates trace priorities if using PrioritizedExperienceReplay.
             """
             target_qvals = data[:, 0, np.newaxis]
-            if isinstance(self.memory, memory.PrioritizedExperienceReplay):
+            if False and isinstance(self.memory, memory.PrioritizedExperienceReplay):
                 def update_priorities(_qvals, _target_qvals, _traces_idxs):
                     """Computes the TD error and updates memory priorities."""
                     td_error = np.abs((_target_qvals - _qvals).numpy())[:, 0]
@@ -116,11 +116,8 @@ class DDPG():
             target_qvals[non_final_mask] = self.target_critic.predict_on_batch([target_actions, np.array(non_final_last_next_states)]).squeeze()
 
         # Compute n-step discounted return
-        # If episode ended within any sampled nstep trace - zero out remaining rewards
-        for n in reversed(range(self.nsteps)):
-            rewards = np.array([b[n] for b in reward_batches])
-            target_qvals *= np.array([t[n] for t in not_done_mask])
-            target_qvals = rewards + (self.gamma * target_qvals)
+        rewards = np.array(reward_batches)
+        target_qvals = rewards + (self.gamma * target_qvals)
 
         # Train actor
         if step > 100_000 and step % 10 == 0:
@@ -129,7 +126,7 @@ class DDPG():
         #print(self.memory.last_traces_idxs())
 
         # Train critic
-        PER = isinstance(self.memory, memory.PrioritizedExperienceReplay)
+        PER = False and isinstance(self.memory, memory.PrioritizedExperienceReplay)
         critic_loss_data = np.stack([target_qvals, self.memory.last_traces_idxs()], axis=1) if PER else target_qvals
         q_score = self.critic.predict_on_batch([np.array(action_batch), np.array(state_batch)])
         q_score = np.mean(q_score)
